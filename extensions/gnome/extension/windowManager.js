@@ -11,8 +11,9 @@ const APPLICATION_ID = Wallpaper.APPLICATION_ID;
 const TITLE_PREFIX = `@${APPLICATION_ID}!`;
 
 class ManagedWindow {
-    constructor(window) {
+    constructor(window, launcher) {
         this._window = window;
+        this._launcher = launcher;
         this._signals = [];
         this._lowerIdleId = 0;
         this._states = {
@@ -40,7 +41,7 @@ class ManagedWindow {
         // If anything unminimizes us, snap back immediately.
         this._signals.push(window.connect('notify::minimized', () => {
             if (this._states.keepMinimized && !this._window.minimized)
-                this._window.minimize();
+                this._minimize();
         }));
 
         this._signals.push(window.connect('position-changed', () => {
@@ -76,7 +77,7 @@ class ManagedWindow {
         if (this._states.keepAtBottom && this._window.above)
             this._window.unmake_above();
         if (this._states.keepMinimized && !this._window.minimized) {
-            this._window.minimize();
+            this._minimize();
         } else if (this._states.keepAtBottom && !this._window.minimized &&
                    !this._lowerIdleId) {
             // Defer to idle: lower() before mutter assigns a stack position
@@ -93,6 +94,20 @@ class ManagedWindow {
         }
     }
 
+    _minimize() {
+        // Mutter cannot minimize skip-taskbar windows. Clear the exclusion
+        // temporarily and restore it before the queued visibility update.
+        const wasSkipped = this._window.skip_taskbar;
+        if (wasSkipped)
+            this._launcher?.setWindowListVisible(this._window, true);
+        try {
+            this._window.minimize();
+        } finally {
+            if (wasSkipped)
+                this._launcher?.setWindowListVisible(this._window, false);
+        }
+    }
+
     disconnect() {
         if (this._lowerIdleId) {
             GLib.source_remove(this._lowerIdleId);
@@ -105,6 +120,7 @@ class ManagedWindow {
         }
         this._signals = [];
         this._window = null;
+        this._launcher = null;
     }
 }
 
@@ -137,7 +153,9 @@ export class WindowManager {
             return;
         if (this._managed.has(win))
             return;
-        const mw = new ManagedWindow(win);
+        const mw = new ManagedWindow(win, this._launcher);
+        // Minimize first: setting the native exclusion disables minimizing.
+        this._launcher?.setWindowListVisible(win, false);
         this._managed.set(win, mw);
         // Drop tracking when mutter releases the MetaWindow.
         const unId = win.connect('unmanaged', () => {

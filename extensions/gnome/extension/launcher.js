@@ -153,6 +153,19 @@ export class LaunchSubprocess {
             });
     }
 
+    // Set the native window-list flag used by show-desktop, which Shell's
+    // JavaScript window filters do not affect.
+    setWindowListVisible(window, visible) {
+        if (!this.ownsWindow(window))
+            return;
+        const method = visible ? 'show_in_window_list' : 'hide_from_window_list';
+        // GNOME 49 moved this API from WaylandClient to MetaWindow.
+        if (typeof window[method] === 'function')
+            window[method]();
+        else
+            this._waylandClient?.[method](window);
+    }
+
     /**
      * Returns true iff the given MetaWindow was spawned by this subprocess.
      */
