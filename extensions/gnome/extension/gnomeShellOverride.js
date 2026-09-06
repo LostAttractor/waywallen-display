@@ -403,6 +403,16 @@ export class GnomeShellOverride {
 
     _reloadBackgrounds() {
         Main.layoutManager._updateBackgrounds();
+        // BMS may create its own panel backgrounds before our deferred hook.
+        // Recreate them when installing or removing the wallpaper override.
+        for (const panel of global.blur_my_shell?._panel_blur?.actors_list ?? []) {
+            try {
+                if (panel.static_blur && panel.bg_manager?.backgroundActor)
+                    panel.bg_manager._updateBackgroundActor();
+            } catch (e) {
+                console.warn(`[waywallen] Failed to reload Blur my Shell panel background: ${e}`);
+            }
+        }
         if (Main.screenShield?._dialog?._updateBackgrounds)
             Main.screenShield._dialog._updateBackgrounds();
         try {
