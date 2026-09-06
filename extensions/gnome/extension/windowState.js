@@ -54,6 +54,7 @@ export class WindowStateMonitor {
         this._sigs.push([wm, wm.connect('destroy', queue)]);
         this._sigs.push([disp, disp.connect('notify::focus-window', queue)]);
         this._sigs.push([wsm, wsm.connect('active-workspace-changed', queue)]);
+        this._sigs.push([wsm, wsm.connect('showing-desktop-changed', queue)]);
         this._queue();
     }
 
@@ -94,7 +95,8 @@ export class WindowStateMonitor {
 
         const acc = new Map();  // monitor index -> flags
         for (const w of ws.list_windows()) {
-            if (w.skip_taskbar || w.minimized)
+            // Show-desktop hides normal windows without minimizing them.
+            if (w.skip_taskbar || !w.showing_on_its_workspace())
                 continue;
             if (w.title?.includes(APPLICATION_ID))
                 continue;
