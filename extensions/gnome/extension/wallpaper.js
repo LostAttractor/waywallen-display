@@ -4,7 +4,6 @@
 // corners (in workspace overview) and lifetime automatically.
 
 import Clutter from 'gi://Clutter';
-import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 import Graphene from 'gi://Graphene';
@@ -20,16 +19,46 @@ export const WallpaperRole = Object.freeze({
     Other: 'other',
 });
 
-export function rendererPresentationReady(actor) {
+function rendererHints(actor) {
     const title = actor?.meta_window?.title;
     if (!title?.startsWith(TITLE_PREFIX))
-        return false;
+        return null;
     const payload = title.slice(TITLE_PREFIX.length).split('|', 1)[0];
     try {
-        return JSON.parse(payload).presentationReady === true;
+        return JSON.parse(payload);
     } catch (_e) {
-        return false;
+        return null;
     }
+}
+
+export function rendererPresentationReady(actor) {
+    return rendererHints(actor)?.presentationReady === true;
+}
+
+// A source window can migrate to another output when its monitor disappears.
+// Match its advertised output, never its current MetaWindow monitor index.
+export function findRendererForMonitor(monitorIndex, launcher) {
+    if (!launcher || monitorIndex < 0 || monitorIndex >= global.display.get_n_monitors())
+        return null;
+    const manager = global.backend.get_monitor_manager();
+    const geometry = global.display.get_monitor_geometry(monitorIndex);
+    const actors = global.display.list_all_windows()
+        .map(window => window.get_compositor_private())
+        .filter(actor => actor);
+    const matches = actors.filter(actor => {
+        if (!launcher.ownsWindow(actor.meta_window))
+            return false;
+        const hints = rendererHints(actor);
+        if (hints?.presentationReady !== true)
+            return false;
+        if (hints.connector)
+            return manager.get_monitor_for_connector(hints.connector) === monitorIndex;
+        // Some backends have no connector name. Use the intended geometry
+        // in that case; a moved source window is still not a valid match.
+        return hints.geometry && ['x', 'y', 'width', 'height'].every(
+            key => hints.geometry[key] === geometry[key]);
+    });
+    return matches.length === 1 ? matches[0] : null;
 }
 
 const FADE_IN_MS = 800;
@@ -77,10 +106,9 @@ class LiveWallpaper extends St.Widget {
         this._cloneDestroyId = 0;
         this._sourceActor = null;
         this._sourceDestroyId = 0;
-        this._pollId = 0;
         if (this._role === WallpaperRole.Desktop)
             this.set_style('background-color: black;');
-        this._tryAttach();
+        this.syncRenderer();
     }
 
     // Report no preferred size: the clone's natural (monitor) size would
@@ -111,14 +139,14 @@ class LiveWallpaper extends St.Widget {
         }
     }
 
-    _tryAttach() {
-        if (this._wwDestroyed || this._cloneActor)
+    syncRenderer() {
+        if (this._wwDestroyed)
             return;
-        if (!this._rendererAvailable) {
-            this._showFallback();
+        const renderer = this._rendererAvailable ? this._findRenderer() : null;
+        if (renderer && renderer === this._sourceActor && this._cloneActor)
             return;
-        }
-        const renderer = this._findRenderer();
+        this._detachRenderer();
+        this._showFallback();
         if (renderer) {
             this._cloneActor = new Clutter.Clone({
                 source: renderer,
@@ -129,7 +157,6 @@ class LiveWallpaper extends St.Widget {
                 this._cloneDestroyId = 0;
                 this._detachRenderer();
                 this._showFallback();
-                this._schedulePoll();
             });
             this._sourceActor = renderer;
             this._sourceDestroyId = renderer.connect('destroy',
@@ -152,18 +179,6 @@ class LiveWallpaper extends St.Widget {
             // queue-redraw, i.e. exactly when the renderer commits a buffer.
             return;
         }
-        this._schedulePoll();
-    }
-
-    _schedulePoll() {
-        if (this._wwDestroyed || this._pollId !== 0 || !this._rendererAvailable)
-            return;
-        this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
-            this._pollId = 0;
-            if (!this._cloneActor)
-                this._tryAttach();
-            return GLib.SOURCE_REMOVE;
-        });
     }
 
     // The gsettings MetaBackground behind us is a placeholder solid color.
@@ -203,7 +218,6 @@ class LiveWallpaper extends St.Widget {
         this._sourceActor = null;
         this._detachRenderer();
         this._showFallback();
-        this._schedulePoll();
     }
 
     _detachRenderer() {
@@ -243,54 +257,18 @@ class LiveWallpaper extends St.Widget {
         if (this._wwDestroyed || this._rendererAvailable === available)
             return;
         this._rendererAvailable = available;
-        if (!available) {
-            this._cancelPoll();
-            this._detachRenderer();
-            this._showFallback();
-            return;
-        }
-        if (this._cloneActor) {
-            this.opacity = 255;
-            this._cloneActor.ease({
-                opacity: 255,
-                duration: FADE_IN_MS,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
-            this._dimBackdrop(true);
-            return;
-        }
-        this._tryAttach();
+        this.syncRenderer();
     }
 
     setRendererLauncher(launcher) {
         if (this._wwDestroyed || this._rendererLauncher === launcher)
             return;
-        this._cancelPoll();
-        this._detachRenderer();
         this._rendererLauncher = launcher;
-        this._showFallback();
-        this._tryAttach();
+        this.syncRenderer();
     }
 
     _findRenderer() {
-        const actors = global.display.list_all_windows()
-            .map(window => window.get_compositor_private())
-            .filter(actor => actor);
-        const ours = actors.filter(a =>
-            a.meta_window.title?.includes(APPLICATION_ID) &&
-            this._rendererLauncher?.ownsWindow(a.meta_window) &&
-            rendererPresentationReady(a));
-
-        const numMonitors = global.display.get_n_monitors();
-        if (ours.length < numMonitors)
-            return null;
-
-        const monitorIndices = ours.map(a => a.meta_window.get_monitor());
-        if (new Set(monitorIndices).size !== monitorIndices.length)
-            return null;
-
-        return ours.find(a =>
-            a.meta_window.get_monitor() === this._monitorIndex) ?? null;
+        return findRendererForMonitor(this._monitorIndex, this._rendererLauncher);
     }
 
     setPresentation(presentation) {
@@ -320,13 +298,6 @@ class LiveWallpaper extends St.Widget {
             presentation.config.pauseEffect.blur.radius);
     }
 
-    _cancelPoll() {
-        if (this._pollId) {
-            GLib.source_remove(this._pollId);
-            this._pollId = 0;
-        }
-    }
-
     _cleanup() {
         if (this._wwDestroyed)
             return;
@@ -334,7 +305,6 @@ class LiveWallpaper extends St.Widget {
         const onDestroyed = this._onDestroyed;
         this._onDestroyed = null;
         onDestroyed?.(this);
-        this._cancelPoll();
         this._detachRenderer();
         this._dimBackdrop(false);
         if (this._backgroundActor && this._backgroundDestroyId)
