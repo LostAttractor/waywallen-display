@@ -140,9 +140,8 @@ class MonitorRenderer {
         });
 
         const geom = this._monitor.get_geometry();
-        // position must be this monitor's origin: windowManager pins the
-        // window there, else every monitor's window collapses onto (0,0) and
-        // get_monitor() stops being unique for per-monitor matching.
+        // Keep the hidden source anchored at its intended origin. Shell
+        // matches its connector identity even if Mutter later moves it.
         this._updateWindowTitle();
 
         // Pin the size: a minimized Wayland window gets no configure, so the
@@ -440,6 +439,9 @@ class MonitorRenderer {
             keepAtBottom: true,
             keepPosition: true,
             position: [geometry.x, geometry.y],
+            connector: this._monitor.get_connector?.() || null,
+            geometry: {x: geometry.x, y: geometry.y,
+                width: geometry.width, height: geometry.height},
             presentationReady: this._presentationReady,
         });
         this._window.set_title(`@${APP_ID}!${hint}|${this._index}`);
@@ -533,6 +535,110 @@ class MonitorRenderer {
     }
 }
 
+// Keep surviving outputs connected. Recreate only renderers whose native
+// extent, scale, refresh rate or origin changed, batching Wayland notifications.
+class MonitorRenderers {
+    constructor(app, monitors, opts) {
+        this._app = app;
+        this._monitors = monitors;
+        this._opts = opts;
+        this._entries = new Map();
+        this._signals = new Map();
+        this._itemsChangedId = 0;
+        this._updateId = 0;
+    }
+
+    start() {
+        this._app.hold(); // Also survive temporarily having no outputs.
+        this._itemsChangedId = this._monitors.connect('items-changed', () => this._queue());
+        this._sync();
+    }
+
+    _currentMonitors() {
+        const monitors = [];
+        for (let i = 0; i < this._monitors.get_n_items(); i++) {
+            const monitor = this._monitors.get_item(i);
+            if (monitor.is_valid())
+                monitors.push(monitor);
+        }
+        return monitors;
+    }
+
+    _prune(monitors) {
+        for (const [monitor, entry] of this._entries) {
+            if (!monitors.includes(monitor)) {
+                entry.renderer.destroy();
+                this._entries.delete(monitor);
+            }
+        }
+        for (const [monitor, id] of this._signals) {
+            if (!monitors.includes(monitor)) {
+                monitor.disconnect(id);
+                this._signals.delete(monitor);
+            }
+        }
+        this._publish();
+    }
+
+    _publish() {
+        renderers.splice(0, renderers.length,
+            ...[...this._entries.values()].map(entry => entry.renderer));
+    }
+
+    _queue() {
+        // Stop reading and routing input to a disconnected monitor immediately.
+        this._prune(this._currentMonitors());
+        if (this._updateId)
+            GLib.source_remove(this._updateId);
+        this._updateId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+            this._updateId = 0;
+            this._sync();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _sync() {
+        const monitors = this._currentMonitors();
+        this._prune(monitors);
+        for (const [index, monitor] of monitors.entries()) {
+            if (!this._signals.has(monitor)) {
+                const id = monitor.connect('notify', (_monitor, property) => {
+                    if (['geometry', 'scale', 'scale-factor', 'refresh-rate', 'connector', 'valid']
+                        .includes(property.name))
+                        this._queue();
+                });
+                this._signals.set(monitor, id);
+            }
+            const geometry = monitor.get_geometry();
+            const signature = JSON.stringify([monitorKey(monitor, index),
+                geometry.x, geometry.y, geometry.width, geometry.height,
+                monitor.get_scale?.() ?? monitor.get_scale_factor(), monitor.get_refresh_rate()]);
+            let entry = this._entries.get(monitor);
+            if (entry?.signature !== signature) {
+                entry?.renderer.destroy();
+                const renderer = new MonitorRenderer(monitor, index, this._opts);
+                entry = {signature, renderer};
+                this._entries.set(monitor, entry);
+                renderer.build(this._app);
+            } else if (entry.renderer._index !== index) {
+                entry.renderer._index = index;
+                entry.renderer._updateWindowTitle();
+            }
+        }
+        this._publish();
+    }
+
+    destroy() {
+        if (this._updateId) {
+            GLib.source_remove(this._updateId);
+            this._updateId = 0;
+        }
+        this._monitors.disconnect(this._itemsChangedId);
+        this._prune([]);
+        this._app.release();
+    }
+}
+
 const opts = parseArgs(ARGV);
 
 const app = new Gtk.Application({
@@ -605,28 +711,19 @@ function readInputStdin() {
     loop();
 }
 
+let monitorRenderers = null;
 app.connect('activate', () => {
-    const display = Gdk.Display.get_default();
-    const monitors = display.get_monitors();
-    const n = monitors.get_n_items();
-    if (n === 0) {
-        printerr('[ww-renderer] no monitors; exiting');
-        app.quit();
+    if (monitorRenderers)
         return;
-    }
-    for (let i = 0; i < n; i++) {
-        const mon = monitors.get_item(i);
-        const r = new MonitorRenderer(mon, i, opts);
-        r.build(app);
-        renderers.push(r);
-    }
+    const display = Gdk.Display.get_default();
+    monitorRenderers = new MonitorRenderers(app, display.get_monitors(), opts);
+    monitorRenderers.start();
     readInputStdin();
 });
 
 app.connect('shutdown', () => {
-    for (const r of renderers)
-        r.destroy();
-    renderers = [];
+    monitorRenderers?.destroy();
+    monitorRenderers = null;
 });
 
 const status = app.run([system.programInvocationName]);
