@@ -19,8 +19,7 @@ export class GnomeShellOverride {
     constructor(settings) {
         this._injection = new InjectionManager();
         this._settings = settings;
-        // LiveWallpaper unregisters itself before releasing its actors and callbacks.
-        this._wallpaperActors = new Set();
+        this._wallpapers = new Map(); // Background actor -> owned wallpaper.
         this._desktopPresentation = new Map();
         this._rendererAvailable = false;
         this._rendererLauncher = null;
@@ -37,12 +36,7 @@ export class GnomeShellOverride {
                 const role = this._container === Main.layoutManager._backgroundGroup
                     ? Wallpaper.WallpaperRole.Desktop
                     : Wallpaper.WallpaperRole.Other;
-                this.waywallenActor = new Wallpaper.LiveWallpaper(
-                    backgroundActor, role, self._rendererAvailable, self._rendererLauncher,
-                    actor => self._wallpaperActors.delete(actor));
-                self._wallpaperActors.add(this.waywallenActor);
-                if (role === Wallpaper.WallpaperRole.Desktop)
-                    self._applyPresentationToActor(this.waywallenActor);
+                this.waywallenActor = self._ensureWallpaper(backgroundActor, role);
                 return backgroundActor;
             });
 
@@ -124,6 +118,10 @@ export class GnomeShellOverride {
         }
 
         this._setupOverviewBackdrop();
+        this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => {
+            this._invalidateOverviewClones();
+            this._syncRenderers();
+        });
 
         if (!Main.sessionMode.isLocked)
             this._reloadBackgrounds();
@@ -150,13 +148,17 @@ export class GnomeShellOverride {
     }
 
     disable() {
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = 0;
+        }
         for (const id of this._overviewSettingsIds || []) {
             try { this._settings?.disconnect(id); } catch (_e) {}
         }
         this._overviewSettingsIds = [];
         this._injection.clear();
-        const actors = [...this._wallpaperActors];
-        this._wallpaperActors.clear();
+        const actors = [...this._wallpapers.values()];
+        this._wallpapers.clear();
         this._desktopPresentation.clear();
         for (const a of actors) {
             try { a.destroy(); } catch (_e) {}
@@ -181,12 +183,12 @@ export class GnomeShellOverride {
         try {
             this._overviewClones = [];
             this._overviewGroup = Main.layoutManager.overviewGroup;
-            this._overviewBackdropPoll = GLib.timeout_add(
+            this._rendererPollId = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT, 1000, () => {
-                    try { this._syncOverviewBackdrop(); } catch (_e) {}
+                    try { this._syncRenderers(); } catch (_e) {}
                     return GLib.SOURCE_CONTINUE;
                 });
-            try { this._syncOverviewBackdrop(); } catch (_e) {}
+            try { this._syncRenderers(); } catch (_e) {}
             // Keep our clones correctly stacked: just above blur-my-shell's
             // overview background group if present (so our wallpaper shows
             // over its static blur), otherwise at the very bottom. Re-evaluate
@@ -225,43 +227,70 @@ export class GnomeShellOverride {
     }
 
     _invalidateOverviewClones() {
-        for (const entry of [...(this._overviewClones || [])]) {
+        const entries = this._overviewClones || [];
+        this._overviewClones = [];
+        for (const entry of entries) {
             entry.blurController?.destroy();
             try { this._overviewGroup?.remove_child(entry.clone); } catch (_e) {}
             try { entry.clone.destroy(); } catch (_e) {}
         }
-        this._overviewClones = [];
+    }
+
+    _syncRenderers() {
+        // The current GNOME background is authoritative, even if its child
+        // was removed or the background predates our creation hook.
+        for (const manager of Main.layoutManager._bgManagers) {
+            if (manager.backgroundActor)
+                manager.waywallenActor = this._ensureWallpaper(
+                    manager.backgroundActor, Wallpaper.WallpaperRole.Desktop);
+        }
+        // Output identities can settle after monitors-changed while source
+        // windows survive, so every view must reconcile its current binding.
+        for (const actor of this._wallpapers.values())
+            actor.syncRenderer();
+        this._syncOverviewBackdrop();
+    }
+
+    _ensureWallpaper(background, role) {
+        const existing = this._wallpapers.get(background);
+        if (existing)
+            return existing;
+        const actor = new Wallpaper.LiveWallpaper(
+            background, role, this._rendererAvailable, this._rendererLauncher,
+            destroyed => {
+                if (this._wallpapers.get(background) === destroyed)
+                    this._wallpapers.delete(background);
+            });
+        this._wallpapers.set(background, actor);
+        if (role === Wallpaper.WallpaperRole.Desktop)
+            this._applyPresentationToActor(actor);
+        return actor;
     }
 
     _syncOverviewBackdrop() {
-        if (!this._overviewWallpaper) {
+        if (!this._overviewWallpaper || !this._rendererAvailable || !this._rendererLauncher) {
             this._invalidateOverviewClones();
             return;
         }
 
         const group = this._overviewGroup;
 
-        const actors = global.display.list_all_windows()
-            .map(window => window.get_compositor_private())
-            .filter(actor => actor);
-        const renderers = actors.filter(a =>
-            a?.meta_window?.title?.includes(APPLICATION_ID) &&
-            Wallpaper.rendererPresentationReady(a));
-        const currentSources = new Set(renderers);
+        const currentSources = new Map();
         const nMonitors = global.display.get_n_monitors();
 
         for (let m = 0; m < nMonitors; m++) {
-            const src = renderers.find(a => a.meta_window.get_monitor() === m);
+            const src = Wallpaper.findRendererForMonitor(m, this._rendererLauncher);
             if (!src || src.width <= 0)
                 continue;
+            currentSources.set(m, src);
             const geom = global.display.get_monitor_geometry(m);
             let entry = this._overviewClones.find(c => c.monitor === m);
             if (!entry || entry.clone.source !== src) {
                 if (entry) {
+                    this._overviewClones = this._overviewClones.filter(c => c !== entry);
                     entry.blurController?.destroy();
                     try { group.remove_child(entry.clone); } catch (_e2) {}
                     try { entry.clone.destroy(); } catch (_e2) {}
-                    this._overviewClones = this._overviewClones.filter(c => c !== entry);
                 }
                 const clone = new Clutter.Clone({
                     source: src,
@@ -284,13 +313,14 @@ export class GnomeShellOverride {
             entry.clone.set_scale(sx, sy);
         }
 
-        // prune clones whose renderer disappeared (e.g. it restarted)
+        // Remove disconnected outputs and sources which are no longer valid
+        // for that output, even if their old windows still exist.
         for (const entry of [...this._overviewClones]) {
-            if (!currentSources.has(entry.clone.source)) {
+            if (currentSources.get(entry.monitor) !== entry.clone.source) {
+                this._overviewClones = this._overviewClones.filter(c => c !== entry);
                 entry.blurController?.destroy();
                 try { group.remove_child(entry.clone); } catch (_e) {}
                 try { entry.clone.destroy(); } catch (_e) {}
-                this._overviewClones = this._overviewClones.filter(c => c !== entry);
             }
         }
 
@@ -299,9 +329,9 @@ export class GnomeShellOverride {
 
     _teardownOverviewBackdrop() {
         try {
-            if (this._overviewBackdropPoll) {
-                GLib.source_remove(this._overviewBackdropPoll);
-                this._overviewBackdropPoll = 0;
+            if (this._rendererPollId) {
+                GLib.source_remove(this._rendererPollId);
+                this._rendererPollId = 0;
             }
             for (const id of ['_overviewChildAdded', '_overviewChildRemoved']) {
                 if (this[id]) {
@@ -354,7 +384,7 @@ export class GnomeShellOverride {
 
     resetPresentation() {
         this._desktopPresentation.clear();
-        for (const actor of this._wallpaperActors) {
+        for (const actor of this._wallpapers.values()) {
             if (actor.role === Wallpaper.WallpaperRole.Desktop)
                 actor.setPresentation(null);
         }
@@ -364,16 +394,21 @@ export class GnomeShellOverride {
         if (this._rendererAvailable === available)
             return;
         this._rendererAvailable = available;
-        for (const actor of this._wallpaperActors) {
+        for (const actor of this._wallpapers.values()) {
             try { actor.setRendererAvailable(available); } catch (_e) {}
         }
+        this._syncOverviewBackdrop();
     }
 
     setRendererLauncher(launcher) {
+        if (this._rendererLauncher === launcher)
+            return;
+        this._invalidateOverviewClones();
         this._rendererLauncher = launcher;
-        for (const actor of this._wallpaperActors) {
+        for (const actor of this._wallpapers.values()) {
             try { actor.setRendererLauncher(launcher); } catch (_e) {}
         }
+        this._syncOverviewBackdrop();
     }
 
     _geometryKey(geometry) {
@@ -394,7 +429,7 @@ export class GnomeShellOverride {
     }
 
     _syncDesktopPresentation(key) {
-        for (const actor of this._wallpaperActors) {
+        for (const actor of this._wallpapers.values()) {
             if (actor.role !== Wallpaper.WallpaperRole.Desktop)
                 continue;
             try {
