@@ -37,7 +37,10 @@ export class BlurController {
     _unload() {
         if (!this._effect)
             return;
-        try { this._actor?.remove_effect(this._effect); } catch (_e) {}
+        try {
+            if (this._effect.get_actor() === this._actor)
+                this._actor.remove_effect(this._effect);
+        } catch (_e) {}
         this._effect = null;
     }
 
