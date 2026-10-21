@@ -31,42 +31,36 @@ function rendererHints(actor) {
     }
 }
 
-export function rendererPresentationReady(actor) {
-    return rendererHints(actor)?.presentationReady === true;
-}
-
 // A source window can migrate to another output when its monitor disappears.
 // Match its advertised output, never its current MetaWindow monitor index.
-export function findRendererForMonitor(monitorIndex, launcher) {
-    if (!launcher || monitorIndex < 0 || monitorIndex >= global.display.get_n_monitors())
-        return null;
+export function collectRenderers(actors, launcher) {
+    const matches = new Map();
+    if (!launcher)
+        return matches;
     const manager = global.backend.get_monitor_manager();
-    const geometry = global.display.get_monitor_geometry(monitorIndex);
-    const actors = global.display.list_all_windows()
-        .map(window => window.get_compositor_private())
-        .filter(actor => actor);
-    const matches = actors.filter(actor => {
+    const geometries = Array.from({length: global.display.get_n_monitors()},
+        (_, index) => global.display.get_monitor_geometry(index));
+    for (const actor of actors) {
         if (!launcher.ownsWindow(actor.meta_window))
-            return false;
+            continue;
         const hints = rendererHints(actor);
-        if (hints?.presentationReady !== true)
-            return false;
-        if (hints.connector)
-            return manager.get_monitor_for_connector(hints.connector) === monitorIndex;
-        // Some backends have no connector name. Use the intended geometry
-        // in that case; a moved source window is still not a valid match.
-        return hints.geometry && ['x', 'y', 'width', 'height'].every(
-            key => hints.geometry[key] === geometry[key]);
-    });
-    return matches.length === 1 ? matches[0] : null;
+        if (hints?.presentationReady !== true || actor.width <= 0 || actor.height <= 0)
+            continue;
+        const index = hints.connector
+            ? manager.get_monitor_for_connector(hints.connector)
+            : geometries.findIndex(geometry => hints.geometry &&
+                ['x', 'y', 'width', 'height'].every(key => hints.geometry[key] === geometry[key]));
+        if (index >= 0 && index < geometries.length)
+            matches.set(index, matches.has(index) ? null : actor);
+    }
+    return new Map([...matches].filter(([, actor]) => actor));
 }
 
 const FADE_IN_MS = 800;
 
 export const LiveWallpaper = GObject.registerClass(
 class LiveWallpaper extends St.Widget {
-    _init(backgroundActor, role = WallpaperRole.Other, rendererAvailable = false,
-        rendererLauncher = null, onDestroyed = null) {
+    _init(backgroundActor, role = WallpaperRole.Other, onDestroyed = null, onChanged = null) {
         super._init({
             // FixedLayout: we position the clone ourselves in vfunc_allocate
             // (top-left origin, scaled to fill). BinLayout centered the
@@ -85,18 +79,15 @@ class LiveWallpaper extends St.Widget {
         this._backgroundActor = backgroundActor;
         this._monitorIndex = backgroundActor.monitor;
         this._role = role;
-        this._rendererAvailable = rendererAvailable;
-        this._rendererLauncher = rendererLauncher;
         this._presentation = null;
         this._blurController = null;
         this._wwDestroyed = false;
         this._onDestroyed = onDestroyed;
+        this._onChanged = onChanged;
         this._destroyId = this.connect('destroy', () => this._cleanup());
-        this._backgroundDestroyId = backgroundActor.connect('destroy', () => {
-            // The parent is disposing; do not read its content during child teardown.
-            this._backgroundActor = null;
-            this._backgroundDestroyId = 0;
-            this._cleanup();
+        this.connect('child-removed', (_parent, child) => {
+            if (child === this._cloneActor)
+                this._onChanged?.();
         });
 
         backgroundActor.layout_manager = new Clutter.BinLayout();
@@ -108,7 +99,7 @@ class LiveWallpaper extends St.Widget {
         this._sourceDestroyId = 0;
         if (this._role === WallpaperRole.Desktop)
             this.set_style('background-color: black;');
-        this.syncRenderer();
+        this._showFallback();
     }
 
     // Report no preferred size: the clone's natural (monitor) size would
@@ -139,12 +130,16 @@ class LiveWallpaper extends St.Widget {
         }
     }
 
-    syncRenderer() {
+    syncRenderer(renderer) {
         if (this._wwDestroyed)
             return;
-        const renderer = this._rendererAvailable ? this._findRenderer() : null;
-        if (renderer && renderer === this._sourceActor && this._cloneActor)
+        if (renderer && renderer === this._sourceActor && this._cloneActor) {
+            if (this._cloneActor.get_parent() !== this) {
+                this._cloneActor.get_parent()?.remove_child(this._cloneActor);
+                this.add_child(this._cloneActor);
+            }
             return;
+        }
         this._detachRenderer();
         this._showFallback();
         if (renderer) {
@@ -157,6 +152,7 @@ class LiveWallpaper extends St.Widget {
                 this._cloneDestroyId = 0;
                 this._detachRenderer();
                 this._showFallback();
+                this._onChanged?.();
             });
             this._sourceActor = renderer;
             this._sourceDestroyId = renderer.connect('destroy',
@@ -218,6 +214,7 @@ class LiveWallpaper extends St.Widget {
         this._sourceActor = null;
         this._detachRenderer();
         this._showFallback();
+        this._onChanged?.();
     }
 
     _detachRenderer() {
@@ -253,22 +250,10 @@ class LiveWallpaper extends St.Widget {
         }
     }
 
-    setRendererAvailable(available) {
-        if (this._wwDestroyed || this._rendererAvailable === available)
-            return;
-        this._rendererAvailable = available;
-        this.syncRenderer();
-    }
-
-    setRendererLauncher(launcher) {
-        if (this._wwDestroyed || this._rendererLauncher === launcher)
-            return;
-        this._rendererLauncher = launcher;
-        this.syncRenderer();
-    }
-
-    _findRenderer() {
-        return findRendererForMonitor(this._monitorIndex, this._rendererLauncher);
+    destroyWithBackground() {
+        // The owner is disposing the parent; its content is no longer readable.
+        this._backgroundActor = null;
+        this.destroy();
     }
 
     setPresentation(presentation) {
@@ -302,16 +287,13 @@ class LiveWallpaper extends St.Widget {
         if (this._wwDestroyed)
             return;
         this._wwDestroyed = true;
+        this._onChanged = null;
         const onDestroyed = this._onDestroyed;
         this._onDestroyed = null;
         onDestroyed?.(this);
         this._detachRenderer();
         this._dimBackdrop(false);
-        if (this._backgroundActor && this._backgroundDestroyId)
-            this._backgroundActor.disconnect(this._backgroundDestroyId);
-        this._backgroundDestroyId = 0;
         this._backgroundActor = null;
-        this._rendererLauncher = null;
         this._presentation = null;
         if (this._destroyId) {
             this.disconnect(this._destroyId);
