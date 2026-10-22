@@ -5,6 +5,9 @@
 
 import GLib from 'gi://GLib';
 
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {getLoginManager} from 'resource:///org/gnome/shell/misc/loginManager.js';
+
 import * as Wallpaper from './wallpaper.js';
 
 const APPLICATION_ID = Wallpaper.APPLICATION_ID;
@@ -127,7 +130,8 @@ class ManagedWindow {
 export class WindowManager {
     constructor() {
         this._managed = new Map();   // MetaWindow -> ManagedWindow
-        this._mapId = 0;
+        this._signals = [];
+        this._refreshId = 0;
         // Used to verify window ownership via Meta.WaylandClient.owns_window.
         this._launcher = null;
     }
@@ -137,8 +141,34 @@ export class WindowManager {
     }
 
     enable() {
-        this._mapId = global.window_manager.connect_after('map',
-            (_wm, actor) => this._onMap(actor));
+        const wm = global.window_manager;
+        const display = global.display;
+        const layout = Main.layoutManager;
+        const login = getLoginManager();
+        const queue = () => this._queueRefresh();
+        this._signals = [
+            [wm, wm.connect_after('map', (_wm, actor) => this._onMap(actor))],
+            [display, display.connect('restacked', queue)],
+            [layout, layout.connect('monitors-changed', queue)],
+            [login, login.connect('prepare-for-sleep', (_login, sleeping) => {
+                if (!sleeping)
+                    queue();
+            })],
+        ];
+    }
+
+    _queueRefresh() {
+        if (this._refreshId || !this._managed.size)
+            return;
+        // Reapply constraints after Mutter finishes rebuilding its window stack.
+        this._refreshId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._refreshId = 0;
+            for (const [window, managed] of this._managed) {
+                managed._refresh();
+                this._launcher?.setWindowListVisible(window, false);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _onMap(actor) {
@@ -151,8 +181,12 @@ export class WindowManager {
         const ownsOk = this._launcher?.ownsWindow?.(win);
         if (!titleOk && !ownsOk)
             return;
-        if (this._managed.has(win))
+        const managed = this._managed.get(win);
+        if (managed) {
+            managed._refresh();
+            this._launcher?.setWindowListVisible(win, false);
             return;
+        }
         const mw = new ManagedWindow(win, this._launcher);
         // Minimize first: setting the native exclusion disables minimizing.
         this._launcher?.setWindowListVisible(win, false);
@@ -160,19 +194,20 @@ export class WindowManager {
         // Drop tracking when mutter releases the MetaWindow.
         const unId = win.connect('unmanaged', () => {
             const entry = this._managed.get(win);
-            if (entry) {
-                entry.disconnect();
-                this._managed.delete(win);
-            }
-            try { win.disconnect(unId); } catch (_e) {}
+            this._managed.delete(win);
+            entry?.disconnect();
         });
+        mw._signals.push(unId);
     }
 
     disable() {
-        if (this._mapId) {
-            global.window_manager.disconnect(this._mapId);
-            this._mapId = 0;
+        if (this._refreshId) {
+            GLib.source_remove(this._refreshId);
+            this._refreshId = 0;
         }
+        for (const [object, id] of this._signals)
+            object.disconnect(id);
+        this._signals = [];
         for (const mw of this._managed.values())
             mw.disconnect();
         this._managed.clear();
