@@ -362,18 +362,15 @@ export class GnomeShellOverride {
                     try { group.remove_child(entry.clone); } catch (_e2) {}
                     try { entry.clone.destroy(); } catch (_e2) {}
                 }
+                // The overview transition already animates these ready frames.
                 const clone = new Clutter.Clone({
                     source: src,
-                    opacity: 0,
+                    opacity: 255,
                 });
                 const blurController = new BlurController(
                     clone, 'waywallen-overview-blur');
                 this._applyOverviewBlur(blurController);
                 group.add_child(clone);
-                clone.ease({
-                    opacity: 255, duration: 400,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                });
                 entry = {clone, monitor: m, blurController};
                 clone.connect('destroy', () => {
                     if (!this._overviewClones.includes(entry))

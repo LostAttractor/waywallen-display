@@ -131,6 +131,40 @@ test('events coalesce into one source snapshot shared by desktop and overview wi
     assert.equal(s.errors.length, 0);
 });
 
+test('reopening overview previews reuses ready frames without another fade', () => {
+    const s = setup();
+    const main = s.background();
+    const source = s.renderer('DP-1');
+    s.flush();
+    const desktopClone = s.view(main)._cloneActor;
+    const backdrop = s.override._overviewClones[0].clone;
+    assert.equal(backdrop.opacity, 255);
+    assert.equal(backdrop.easeCalls.length, 0, 'overview backdrop must be ready before it is shown');
+    for (let visit = 0; visit < 3; visit++) {
+        const preview = s.background(0, 'other');
+        s.flush();
+        const view = s.view(preview);
+        assert.equal(view._cloneActor.source, source);
+        assert.equal(view.opacity, 255);
+        assert.equal(view._cloneActor.opacity, 255);
+        assert.equal(view._cloneActor.easeCalls.length, 0);
+        assert.equal(preview.backgroundActor.content.brightness, 0);
+        assert.equal(s.view(main)._cloneActor, desktopClone);
+        assert.equal(s.override._overviewClones[0].clone, backdrop);
+        preview.destroy();
+        s.flush();
+        assert.equal(s.override._backgrounds.size, 1);
+    }
+    backdrop.destroy();
+    s.flush();
+    const restored = s.override._overviewClones[0].clone;
+    assert.equal(restored.source, source);
+    assert.equal(restored.opacity, 255);
+    assert.equal(restored.easeCalls.length, 0, 'backdrop recovery must not introduce another fade');
+    assert.equal(s.errors.length, 0);
+    s.override.disable();
+});
+
 test('readiness, first frame and size changes synchronize views without another map event', () => {
     const s = setup();
     const main = s.background();
