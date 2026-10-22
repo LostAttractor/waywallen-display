@@ -41,7 +41,12 @@ export class Actor extends Signals {
     set_child_above_sibling() {}
     set_position(x, y) { Object.assign(this, {x, y}); }
     set_scale(scale_x, scale_y) { Object.assign(this, {scale_x, scale_y}); }
-    ease(props) { assert.ok(!this.disposed); this.opacity = props.opacity; }
+    easeCalls = [];
+    ease(props) {
+        assert.ok(!this.disposed);
+        this.easeCalls.push({from: this.opacity, ...props});
+        this.opacity = props.opacity;
+    }
     remove_all_transitions() { assert.ok(!this.disposed); }
     destroy() {
         assert.ok(!this.disposed, 'actor destroyed twice');

@@ -143,9 +143,10 @@ class LiveWallpaper extends St.Widget {
         this._detachRenderer();
         this._showFallback();
         if (renderer) {
+            // Shell owns the transition for overview and lock-screen views.
             this._cloneActor = new Clutter.Clone({
                 source: renderer,
-                opacity: 0,
+                opacity: this._role === WallpaperRole.Desktop ? 0 : 255,
             });
             this._cloneDestroyId = this._cloneActor.connect('destroy', () => {
                 this._cloneActor = null;
@@ -162,13 +163,13 @@ class LiveWallpaper extends St.Widget {
                 this._blurController = new BlurController(
                     this._cloneActor, 'waywallen-desktop-blur');
                 this._applyPresentation();
+                this._cloneActor.ease({
+                    opacity: 255,
+                    duration: FADE_IN_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
             }
             this.opacity = 255;
-            this._cloneActor.ease({
-                opacity: 255,
-                duration: FADE_IN_MS,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            });
             // Black out the gsettings placeholder behind us (see _dimBackdrop).
             this._dimBackdrop(true);
             // No redraw timer: Clutter.Clone repaints on the source's

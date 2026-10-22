@@ -126,6 +126,43 @@ test('overview fallback restores brightness while the desktop fallback remains b
     assert.deepEqual(desktop.content, {brightness: 0, vignette: true});
 });
 
+test('overview previews show ready frames immediately while keeping the placeholder black', () => {
+    const s = setup();
+    const first = s.renderer();
+    const next = s.renderer();
+    const view = s.wallpaper('other');
+    assert.equal(view.actor.opacity, 0);
+    for (const source of [first.actor, next.actor]) {
+        view.actor.syncRenderer(source);
+        const clone = view.actor._cloneActor;
+        assert.equal(view.actor.opacity, 255);
+        assert.equal(clone.opacity, 255);
+        assert.equal(clone.easeCalls.length, 0, 'ready overview frames must not fade from black');
+        assert.deepEqual(view.content, {brightness: 0, vignette: true});
+        view.actor.syncRenderer(null);
+        assert.ok(clone.disposed);
+        assert.equal(view.actor.opacity, 0);
+        assert.deepEqual(view.content, {brightness: 0.5, vignette: false});
+    }
+    view.background.destroy();
+});
+
+test('desktop attachment keeps its fade without restarting unchanged bindings', () => {
+    const s = setup();
+    const source = s.renderer();
+    const view = s.wallpaper();
+    view.actor.syncRenderer(source.actor);
+    const clone = view.actor._cloneActor;
+    assert.equal(clone.easeCalls.length, 1);
+    assert.equal(clone.easeCalls[0].from, 0);
+    assert.equal(clone.easeCalls[0].opacity, 255);
+    assert.equal(clone.easeCalls[0].duration, 800);
+    view.actor.syncRenderer(source.actor);
+    assert.equal(view.actor._cloneActor, clone);
+    assert.equal(clone.easeCalls.length, 1);
+    view.background.destroy();
+});
+
 test('output identity excludes a migrated disconnected source', () => {
     const s = setup();
     s.renderer('DP-2', {x: 1920, y: 0, width: 1920, height: 1080});
