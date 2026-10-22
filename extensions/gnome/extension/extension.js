@@ -172,8 +172,7 @@ export default class WaywallenExtension extends Extension {
             }
             if (frame.type === 'reset') this._winState?.resetConfig(frame.geometry);
             const applied = this._override.applyControlFrame(frame);
-            if (applied && frame.type === 'reset')
-                this._override.setRendererAvailable(false);
+            // A reset belongs to one output; process availability is shared.
             if (applied && frame.type === 'connection') {
                 this._override.setRendererAvailable(true);
                 const g = frame.geometry;
