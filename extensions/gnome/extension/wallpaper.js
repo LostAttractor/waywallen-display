@@ -171,12 +171,11 @@ class WaywallenRoundedClipEffect extends (Shell.GLSLEffect ?? Clutter.ShaderEffe
     }
 
     _uploadUniforms() {
-        const texture = this.get_texture();
+        // Keep replaced offscreen textures out of the GJS garbage collector.
+        const [hasTarget, width, height] = this.get_target_size();
         const actor = this.get_actor();
-        if (!texture || !actor)
+        if (!hasTarget || !actor)
             return;
-        const width = texture.get_width();
-        const height = texture.get_height();
         const scale = actor.get_resource_scale();
         const [offsetX, offsetY] = fboOffset(actor);
         if (!this._dirty &&
@@ -276,27 +275,29 @@ class LiveWallpaper extends St.Widget {
     vfunc_allocate(box) {
         super.vfunc_allocate(box);
         const clone = this._cloneActor;
-        if (clone && clone.source && clone.source.width > 0) {
-            const sx = box.get_width() / clone.source.width;
-            const sy = box.get_height() / clone.source.height;
-            clone.set_position(0, 0);
-            if (Math.abs((clone.scale_x ?? 1) - sx) > 0.001 ||
-                Math.abs((clone.scale_y ?? 1) - sy) > 0.001)
-                clone.set_scale(sx, sy);
-        }
-        this._syncClip(box);
+        if (!clone?.source || clone.source.width <= 0 || clone.source.height <= 0)
+            return;
+        const sx = box.get_width() / clone.source.width;
+        const sy = box.get_height() / clone.source.height;
+        clone.set_position(0, 0);
+        if (Math.abs((clone.scale_x ?? 1) - sx) > 0.001 ||
+            Math.abs((clone.scale_y ?? 1) - sy) > 0.001)
+            clone.set_scale(sx, sy);
+        this._syncClip(clone, sx, sy);
     }
 
-    _syncClip(box) {
+    _syncClip(clone, previewScaleX, previewScaleY) {
         const monitor = Main.layoutManager.monitors[this._monitorIndex];
         if (!monitor || monitor.width <= 0 || monitor.height <= 0)
             return;
-        const sx = box.get_width() / monitor.width;
-        const sy = box.get_height() / monitor.height;
+        // Clip in the source-sized clone, before the overview scales it.
+        // Clutter can then reuse the same framebuffer throughout the animation.
+        const sx = clone.source.width / monitor.width;
+        const sy = clone.source.height / monitor.height;
         const radius = (this._clipContent?.rounded_clip_radius ?? 0) * sx;
-        if (radius < 0.5 || sy <= 0) {
+        if (radius * previewScaleX < 0.5 || previewScaleY <= 0) {
             if (this._clipEffect) {
-                this.remove_effect(this._clipEffect);
+                clone.remove_effect(this._clipEffect);
                 this._clipEffect = null;
             }
             return;
@@ -307,7 +308,7 @@ class LiveWallpaper extends St.Widget {
         const y = (work.y - monitor.y) * sy;
         if (!this._clipEffect) {
             this._clipEffect = new RoundedClipEffect();
-            this.add_effect(this._clipEffect);
+            clone.add_effect(this._clipEffect);
         }
         this._clipEffect.setGeometry(
             [x, y, x + work.width * sx, y + work.height * sy], radius);
@@ -411,12 +412,15 @@ class LiveWallpaper extends St.Widget {
         if (this._cloneActor) {
             const clone = this._cloneActor;
             this._cloneActor = null;
+            if (this._clipEffect)
+                clone.remove_effect(this._clipEffect);
             if (this._cloneDestroyId) {
                 try { clone.disconnect(this._cloneDestroyId); } catch (_e) {}
                 this._cloneDestroyId = 0;
             }
             try { clone.destroy(); } catch (_e) {}
         }
+        this._clipEffect = null;
     }
 
     _showFallback() {
@@ -479,10 +483,6 @@ class LiveWallpaper extends St.Widget {
             this._clipContent.disconnect(this._clipRadiusId);
         this._clipRadiusId = 0;
         this._clipContent = null;
-        if (this._clipEffect) {
-            this.remove_effect(this._clipEffect);
-            this._clipEffect = null;
-        }
         this._detachRenderer();
         this._dimBackdrop(false);
         this._backgroundActor = null;

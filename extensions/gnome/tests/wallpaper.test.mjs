@@ -8,7 +8,7 @@ import {Actor} from './actors.mjs';
 class ShaderEffect {
     uniforms = new Map();
     get_actor() { return this.actor; }
-    get_texture() { return this.texture; }
+    get_target_size() { return this.targetSize ?? [false, 0, 0]; }
     set_uniform_float(name, count, values) {
         assert.equal(typeof name, 'string');
         assert.equal(values.length, count);
@@ -250,35 +250,48 @@ test('geometry fallback, ownership and ambiguity do not depend on enumeration or
     assert.equal(s.sources(null).size, 0);
 });
 
-test('overview clip follows work area, preview size and animated radius', () => {
+test('overview clip stays on the source-sized clone throughout preview scaling', () => {
     const s = setup();
     const r = s.renderer();
     const {actor, background, content} = s.wallpaper('other');
     actor.syncRenderer(r.actor);
+    const clone = actor._cloneActor;
     actor.vfunc_allocate(allocation(1920, 1080));
-    assert.equal(actor.effects.size, 0);
+    assert.equal(clone.effects.size, 0);
 
     content.rounded_clip_radius = 30;
     content.emit('notify::rounded-clip-radius');
     assert.equal(actor.relayouts, 1);
     actor.vfunc_allocate(allocation(960, 540));
     const effect = actor._clipEffect;
-    assert.ok(actor.effects.has(effect));
-    assert.deepEqual(Array.from(effect._bounds), [20, 16, 960, 540]);
-    assert.equal(effect._radius, 15);
+    assert.equal(actor.effects.size, 0);
+    assert.ok(clone.effects.has(effect));
+    assert.deepEqual(Array.from(effect._bounds), [40, 32, 1920, 1080]);
+    assert.equal(effect._radius, 30);
     assert.equal(actor._cloneActor.scale_x, 0.5);
     assert.equal(actor._cloneActor.scale_y, 0.5);
 
     actor.vfunc_allocate(allocation(480, 270));
     assert.equal(actor._clipEffect, effect);
-    assert.deepEqual(Array.from(effect._bounds), [10, 8, 480, 270]);
-    assert.equal(effect._radius, 7.5);
+    assert.deepEqual(Array.from(effect._bounds), [40, 32, 1920, 1080]);
+    assert.equal(effect._radius, 30);
+    assert.equal(clone.scale_x, 0.25);
+    content.rounded_clip_radius = 40;
+    actor.vfunc_allocate(allocation(480, 270));
+    assert.equal(effect._radius, 40);
 
     content.rounded_clip_radius = 0;
     content.emit('notify::rounded-clip-radius');
     actor.vfunc_allocate(allocation(1920, 1080));
     assert.equal(actor._clipEffect, null);
-    assert.equal(actor.effects.size, 0);
+    assert.equal(clone.effects.size, 0);
+    content.rounded_clip_radius = 30;
+    actor.vfunc_allocate(allocation(480, 270));
+    const next = s.renderer();
+    actor.syncRenderer(next.actor);
+    assert.ok(clone.disposed);
+    assert.equal(clone.effects.size, 0);
+    assert.equal(actor._clipEffect, null);
     background.destroy();
     assert.equal(content.handlers.size, 0);
 });
@@ -291,26 +304,30 @@ test('clip uniforms account for offscreen offset and HiDPI changes', () => {
     content.rounded_clip_radius = 30;
     actor.vfunc_allocate(allocation(960, 540));
     const effect = actor._clipEffect;
-    effect.texture = {get_width: () => 964, get_height: () => 544};
+    const clone = actor._cloneActor;
+    clone.allocation = allocation(1920, 1080);
     effect._uploadUniforms();
-    assert.deepEqual(effect.uniforms.get('bounds'), [22, 18, 962, 542]);
-    assert.deepEqual(effect.uniforms.get('clip_radius'), [15]);
-    assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 964, 1 / 544]);
-
-    actor.resourceScale = 2;
-    effect.texture = {get_width: () => 1928, get_height: () => 1088};
+    assert.equal(effect.uniforms.size, 0, 'skip uploads without an offscreen target');
+    effect.targetSize = [true, 1924, 1084];
     effect._uploadUniforms();
-    assert.deepEqual(effect.uniforms.get('bounds'), [44, 36, 1924, 1084]);
+    assert.deepEqual(effect.uniforms.get('bounds'), [42, 34, 1922, 1082]);
     assert.deepEqual(effect.uniforms.get('clip_radius'), [30]);
-    assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 1928, 1 / 1088]);
+    assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 1924, 1 / 1084]);
 
-    actor.paintVolume = {get_origin: () => ({x: -10, y: -6}),
-        get_width: () => 980, get_height: () => 552};
+    clone.resourceScale = 2;
+    effect.targetSize = [true, 3848, 2168];
     effect._uploadUniforms();
-    assert.deepEqual(effect.uniforms.get('bounds'), [64, 48, 1944, 1096]);
+    assert.deepEqual(effect.uniforms.get('bounds'), [84, 68, 3844, 2164]);
+    assert.deepEqual(effect.uniforms.get('clip_radius'), [60]);
+    assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 3848, 1 / 2168]);
+
+    clone.paintVolume = {get_origin: () => ({x: -10, y: -6}),
+        get_width: () => 1940, get_height: () => 1092};
+    effect._uploadUniforms();
+    assert.deepEqual(effect.uniforms.get('bounds'), [104, 80, 3864, 2176]);
     background.destroy();
     assert.equal(actor._clipEffect, null);
-    assert.equal(actor.effects.size, 0);
+    assert.equal(clone.effects.size, 0);
     assert.equal(content.handlers.size, 0);
 });
 
@@ -323,6 +340,8 @@ for (const shell51 of [false, true]) {
         content.rounded_clip_radius = 30;
         actor.vfunc_allocate(allocation(960, 540));
         const effect = actor._clipEffect;
+        const clone = actor._cloneActor;
+        clone.allocation = allocation(1920, 1080);
         let snippet;
         if (shell51) {
             snippet = effect.vfunc_get_static_snippet();
@@ -335,26 +354,26 @@ for (const shell51 of [false, true]) {
         assert.match(snippet.code, /cogl_color_out \*= rounded_rect_coverage/);
 
         const node = {}, paintContext = {};
-        effect.texture = {get_width: () => 964, get_height: () => 544};
+        effect.targetSize = [true, 1924, 1084];
         effect.vfunc_paint_target(node, paintContext);
         assert.deepEqual(effect.lastPaint, {node, paintContext});
-        assert.deepEqual(effect.uniforms.get('bounds'), [22, 18, 962, 542]);
-        assert.deepEqual(effect.uniforms.get('clip_radius'), [15]);
-        assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 964, 1 / 544]);
+        assert.deepEqual(effect.uniforms.get('bounds'), [42, 34, 1922, 1082]);
+        assert.deepEqual(effect.uniforms.get('clip_radius'), [30]);
+        assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 1924, 1 / 1084]);
 
         content.rounded_clip_radius = 40;
         content.emit('notify::rounded-clip-radius');
         actor.vfunc_allocate(allocation(480, 270));
-        actor.resourceScale = 2;
-        effect.texture = {get_width: () => 968, get_height: () => 548};
+        clone.resourceScale = 2;
+        effect.targetSize = [true, 3848, 2168];
         effect.vfunc_paint_target(node, paintContext);
         assert.equal(actor._clipEffect, effect);
-        assert.deepEqual(effect.uniforms.get('bounds'), [24, 20, 964, 544]);
-        assert.deepEqual(effect.uniforms.get('clip_radius'), [20]);
-        assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 968, 1 / 548]);
+        assert.deepEqual(effect.uniforms.get('bounds'), [84, 68, 3844, 2164]);
+        assert.deepEqual(effect.uniforms.get('clip_radius'), [80]);
+        assert.deepEqual(effect.uniforms.get('pixel_step'), [1 / 3848, 1 / 2168]);
 
         background.destroy();
-        assert.equal(actor.effects.size, 0);
+        assert.equal(clone.effects.size, 0);
         assert.equal(content.handlers.size, 0);
     });
 }
